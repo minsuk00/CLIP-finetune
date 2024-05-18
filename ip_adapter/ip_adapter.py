@@ -48,16 +48,17 @@ class ImageProjModel(torch.nn.Module):
 
 class MLPProjModel(torch.nn.Module):
     """SD model with image prompt"""
+
     def __init__(self, cross_attention_dim=1024, clip_embeddings_dim=1024):
         super().__init__()
-        
+
         self.proj = torch.nn.Sequential(
             torch.nn.Linear(clip_embeddings_dim, clip_embeddings_dim),
             torch.nn.GELU(),
             torch.nn.Linear(clip_embeddings_dim, cross_attention_dim),
-            torch.nn.LayerNorm(cross_attention_dim)
+            torch.nn.LayerNorm(cross_attention_dim),
         )
-        
+
     def forward(self, image_embeds):
         clip_extra_context_tokens = self.proj(image_embeds)
         return clip_extra_context_tokens
@@ -184,9 +185,7 @@ class IPAdapter:
         if not isinstance(negative_prompt, List):
             negative_prompt = [negative_prompt] * num_prompts
 
-        image_prompt_embeds, uncond_image_prompt_embeds = self.get_image_embeds(
-            pil_image=pil_image, clip_image_embeds=clip_image_embeds
-        )
+        x, uncond_image_prompt_embeds = self.get_image_embeds(pil_image=pil_image, clip_image_embeds=clip_image_embeds)
         bs_embed, seq_len, _ = image_prompt_embeds.shape
         image_prompt_embeds = image_prompt_embeds.repeat(1, num_samples, 1)
         image_prompt_embeds = image_prompt_embeds.view(bs_embed * num_samples, seq_len, -1)
@@ -269,7 +268,7 @@ class IPAdapterXL(IPAdapter):
             negative_prompt_embeds = torch.cat([negative_prompt_embeds, uncond_image_prompt_embeds], dim=1)
 
         self.generator = get_generator(seed, self.device)
-        
+
         images = self.pipe(
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
