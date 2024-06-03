@@ -37,7 +37,8 @@ def collect_features(model, loader):
         temp_time = time.time()
 
         x, y = convert_tensor(batch, device=device)
-        x = model(x).image_embeds
+        # x = model(x).image_embeds
+        x = model(x).pooler_output
         X.append(x.detach())
         Y.append(y.detach())
 
@@ -45,7 +46,7 @@ def collect_features(model, loader):
         eta_seconds = (total_len - (cnt + 1)) * avg_time_per_batch
         print(
             f"collect done: {cnt+1} / {total_len}, eta: {datetime.timedelta(seconds=eta_seconds)}, time_passed: {datetime.timedelta(seconds=(time.time()-start_time))}",
-            # end="\r",
+            end="\r",
         )
     X = torch.cat(X).detach()
     Y = torch.cat(Y).detach()

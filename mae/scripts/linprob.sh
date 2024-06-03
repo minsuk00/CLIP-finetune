@@ -7,10 +7,10 @@
 # MODEL_NAME="clip"
 # CKPT_PATH=/scratch/choi/model/CLIP-ViT-H-14-laion2B-s32B-b79K/
 
-MODEL_NAME="finetuned-clip_full_image-only_imagenet100_timestep-400-600_clip-loss-ratio-1_epoch-7"
+MODEL_NAME="finetuned-clip_full_image-only_imagenet100_timestep-400-600_clip-loss-ratio-0.999_epoch-10"
 # MODEL_NAME="finetuned-clip_full_image-text_imagenet100_timestep-400-600_epoch-1"
 # CKPT_PATH=/scratch/choi/output/Diff-Rep/ViT-H/ip-adapter/full_image-only_mscoco_04-27_20:20/checkpoint-2000
-CKPT_PATH=/scratch/choi/output/Diff-Rep/ViT-H/ip-adapter/full_image-text_imagenet100_timestep-400-600_clip-loss-ratio-1.0_05-17_16:10/checkpoint_42231-step_7-epoch
+CKPT_PATH=/scratch/choi/output/Diff-Rep/ViT-H/ip-adapter/full_image-text_imagenet100_timestep-400-600_clip-loss-ratio-0.999_05-19_15:51/checkpoint_60330-step_10-epoch
 
 
 # DATASET_TYPE=in1k
@@ -29,7 +29,7 @@ OMP_NUM_THREADS=1 python -m torch.distributed.launch --nproc_per_node=3 --master
     --batch_size 512 \
     --model vit_huge_patch14 --cls_token \
     --finetune ${CKPT_PATH} \
-    --epochs 51 \
+    --epochs 50 \
     --blr 0.1 \
     --weight_decay 0.0 \
     --dist_eval --data_path ${DATA_PATH} \

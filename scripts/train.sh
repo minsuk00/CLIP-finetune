@@ -20,10 +20,10 @@ TRAIN_MODALITY=image-text
 # TIME_STEP=all
 TIMESTEP=400-600
 
-RESUME_PATH=_
-# RESUME_PATH=/scratch/choi/output/Diff-Rep/ViT-H/ip-adapter/full_image-only_imagenet100_timestep-400-600_05-05_16:16/checkpoint_73906-step_14-epoch
+# RESUME_PATH=_
+RESUME_PATH=/scratch/choi/output/Diff-Rep/ViT-H/ip-adapter/full_image-text_imagenet100_timestep-400-600_clip-loss-ratio-0.999_05-19_15:51/checkpoint_42231-step_7-epoch
 
-CLIP_LOSS_RATIO=1
+CLIP_LOSS_RATIO=0.999
 ###########################################################
 
 if [ "$DATASET_TYPE" = "mscoco" ]; then
@@ -53,18 +53,20 @@ accelerate launch --num_processes=3 --multi_gpu --main_process_port=29700 --mixe
   --timestep ${TIMESTEP} \
   --mixed_precision="fp16" \
   --resolution=512 \
-  --train_batch_size=7 \
+  --train_batch_size=6 \
   --dataloader_num_workers=8 \
   --learning_rate=1e-04 \
   --weight_decay=0.01 \
   --output_dir ${OUT_DIR} \
   --save_steps=2000 \
-  --eval_epoch=1 \
+  --eval_epoch=3 \
   --clip_loss_ratio=${CLIP_LOSS_RATIO} \
   --num_train_epochs 100
 
 # --logging_dir ${LOG_DIR} \
 # --train_batch_size=8 \
+# --mixed_precision="fp16" \
+
 
 # 14682MiB / 32510MiB  for batch 1 imagenet1k
 # 14682MiB / 32510MiB for batch 1 mscoco

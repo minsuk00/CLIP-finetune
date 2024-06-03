@@ -71,9 +71,7 @@ def collect_features(model, loader):
             x = model(x)
         X.append(x.pooler_output.detach().cpu())
         Y.append(y.detach().cpu())
-        avg_time_per_batch = (avg_time_per_batch * cnt + (time.time() - temp_time)) / (
-            cnt + 1
-        )
+        avg_time_per_batch = (avg_time_per_batch * cnt + (time.time() - temp_time)) / (cnt + 1)
         eta_seconds = (total_len - (cnt + 1)) * avg_time_per_batch
         print(
             f"collect done: {cnt+1} / {total_len}, eta: {datetime.timedelta(seconds=eta_seconds)}, time_passed: {datetime.timedelta(seconds=(time.time()-start_time))}",
@@ -88,9 +86,7 @@ def collect_features(model, loader):
 
 
 def get_args_parser():
-    parser = argparse.ArgumentParser(
-        "MAE linear probing for image classification", add_help=False
-    )
+    parser = argparse.ArgumentParser("MAE linear probing for image classification", add_help=False)
     parser.add_argument(
         "--batch_size",
         default=512,
@@ -145,9 +141,7 @@ def get_args_parser():
         help="lower lr bound for cyclic schedulers that hit 0",
     )
 
-    parser.add_argument(
-        "--warmup_epochs", type=int, default=10, metavar="N", help="epochs to warmup LR"
-    )
+    parser.add_argument("--warmup_epochs", type=int, default=10, metavar="N", help="epochs to warmup LR")
 
     # * Finetuning params
     parser.add_argument("--finetune", default="", help="finetune from checkpoint")
@@ -179,18 +173,12 @@ def get_args_parser():
         default="./output_dir",
         help="path where to save, empty for no saving",
     )
-    parser.add_argument(
-        "--log_dir", default="./output_dir", help="path where to tensorboard log"
-    )
-    parser.add_argument(
-        "--device", default="cuda", help="device to use for training / testing"
-    )
+    parser.add_argument("--log_dir", default="./output_dir", help="path where to tensorboard log")
+    parser.add_argument("--device", default="cuda", help="device to use for training / testing")
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--resume", default="", help="resume from checkpoint")
 
-    parser.add_argument(
-        "--start_epoch", default=0, type=int, metavar="N", help="start epoch"
-    )
+    parser.add_argument("--start_epoch", default=0, type=int, metavar="N", help="start epoch")
     parser.add_argument("--eval", action="store_true", help="Perform evaluation only")
     parser.add_argument(
         "--dist_eval",
@@ -208,15 +196,11 @@ def get_args_parser():
     parser.set_defaults(pin_mem=True)
 
     # distributed training parameters
-    parser.add_argument(
-        "--world_size", default=1, type=int, help="number of distributed processes"
-    )
+    parser.add_argument("--world_size", default=1, type=int, help="number of distributed processes")
     # parser.add_argument("--local_rank", default=-1, type=int)
     parser.add_argument("--local-rank", default=-1, type=int)
     parser.add_argument("--dist_on_itp", action="store_true")
-    parser.add_argument(
-        "--dist_url", default="env://", help="url used to set up distributed training"
-    )
+    parser.add_argument("--dist_url", default="env://", help="url used to set up distributed training")
 
     parser.add_argument("--model_type", default="mae", type=str)
 
@@ -269,12 +253,8 @@ def main(args):
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
     )
-    dataset_train = datasets.ImageFolder(
-        os.path.join(args.data_path, "train"), transform=transform_train
-    )
-    dataset_val = datasets.ImageFolder(
-        os.path.join(args.data_path, "val"), transform=transform_val
-    )
+    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "train"), transform=transform_train)
+    dataset_val = datasets.ImageFolder(os.path.join(args.data_path, "val"), transform=transform_val)
     print(dataset_train)
     print(dataset_val)
 
@@ -334,10 +314,7 @@ def main(args):
             checkpoint_model = checkpoint["model"]
             state_dict = model.state_dict()
             for k in ["head.weight", "head.bias"]:
-                if (
-                    k in checkpoint_model
-                    and checkpoint_model[k].shape != state_dict[k].shape
-                ):
+                if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
                     print(f"Removing key {k} from pretrained checkpoint")
                     del checkpoint_model[k]
 
@@ -435,9 +412,7 @@ def main(args):
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
 
-    optimizer = LARS(
-        model_without_ddp.head.parameters(), lr=args.lr, weight_decay=args.weight_decay
-    )
+    optimizer = LARS(model_without_ddp.head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     print(optimizer)
     loss_scaler = NativeScaler()
 
@@ -454,9 +429,7 @@ def main(args):
 
     if args.eval:
         test_stats = evaluate(data_loader_val, model, device)
-        print(
-            f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%"
-        )
+        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         exit(0)
 
     ##### COLLECT FEATURES
@@ -489,12 +462,8 @@ def main(args):
             pin_memory=True,
         )
 
-        X_train, Y_train = [
-            idist.all_gather(_) for _ in collect_features(new_model, data_loader_train)
-        ]
-        X_val, Y_val = [
-            idist.all_gather(_) for _ in collect_features(new_model, data_loader_val)
-        ]
+        X_train, Y_train = [idist.all_gather(_) for _ in collect_features(new_model, data_loader_train)]
+        X_val, Y_val = [idist.all_gather(_) for _ in collect_features(new_model, data_loader_val)]
 
         X_train = np.concatenate(X_train)
         Y_train = np.concatenate(Y_train)
@@ -546,9 +515,7 @@ def main(args):
         # log_writer = SummaryWriter(log_dir=args.log_dir)
         args.log_dir = os.path.join(
             args.log_dir,
-            args.linprob_dataset
-            + "_"
-            + datetime.datetime.now().strftime("%m-%d_%H:%M"),
+            args.linprob_dataset + "_" + datetime.datetime.now().strftime("%m-%d_%H:%M"),
         )
         args.output_dir = args.log_dir
         log_writer = SummaryWriter(log_dir=args.log_dir)
@@ -573,7 +540,7 @@ def main(args):
             log_writer=log_writer,
             args=args,
         )
-        if args.output_dir and epoch % 50 == 0:
+        if args.output_dir and (epoch + 1) % 500000 == 0:
             misc.save_model(
                 args=args,
                 model=model,
@@ -584,9 +551,7 @@ def main(args):
             )
 
         test_stats = evaluate(data_loader_val, model, device, args)
-        print(
-            f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%"
-        )
+        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         max_accuracy = max(max_accuracy, test_stats["acc1"])
         print(f"Max accuracy: {max_accuracy:.2f}%")
 
@@ -605,9 +570,7 @@ def main(args):
         if args.output_dir and misc.is_main_process():
             if log_writer is not None:
                 log_writer.flush()
-            with open(
-                os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8"
-            ) as f:
+            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
     total_time = time.time() - start_time

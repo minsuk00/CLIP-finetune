@@ -17,7 +17,7 @@ from accelerate import Accelerator,InitProcessGroupKwargs
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
-from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection,CLIPTextModelWithProjection
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection,CLIPTextModelWithProjection, CLIPModel
 from safetensors import safe_open
 from datetime import datetime, timedelta
 from typing import Literal
@@ -405,7 +405,7 @@ def main():
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,                               
-        kwargs_handlers=[ipg_handler],
+        kwargs_handlers=[ipg_handler],gradient_accumulation_steps=2,
     )
     
     # hps = {"learning_rate": args.learning_rate}
@@ -422,15 +422,19 @@ def main():
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
     text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
-    image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.image_encoder_path)
+    # image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.image_encoder_path)
+    clip_model = CLIPModel.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
     # freeze parameters of models to save more memory
     unet.requires_grad_(False)
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     # image_encoder.requires_grad_(False)
-    image_encoder.requires_grad_(True)
-    text_encoder_with_projection = CLIPTextModelWithProjection.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
-    text_encoder_with_projection.requires_grad_(False)
+    # image_encoder.requires_grad_(True)
+    # text_encoder_with_projection = CLIPTextModelWithProjection.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
+    # text_encoder_with_projection.requires_grad_(False)
+    clip_model.requires_grad_(False)
+    clip_model.vision_model.requires_grad_(True)
+    clip_model.visual_projection.requires_grad_(True)
 
     # dataloader
     train_dataset = MyDataset(
@@ -484,24 +488,27 @@ def main():
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     # image_encoder.to(accelerator.device, dtype=weight_dtype)
-    image_encoder.to(accelerator.device)  # let amp set dtype
-    text_encoder_with_projection.to(accelerator.device)  # let amp set dtype
+    # image_encoder.to(accelerator.device)  # let amp set dtype
+    # text_encoder_with_projection.to(accelerator.device)  # let amp set dtype
+    clip_model.to(accelerator.device)
     
     # ip-adapter
     # Linear & LN Layer
     image_proj_model = ImageProjModel(
         cross_attention_dim=unet.config.cross_attention_dim,
-        clip_embeddings_dim=image_encoder.config.projection_dim,
+        # clip_embeddings_dim=image_encoder.config.projection_dim,
+        clip_embeddings_dim=clip_model.config.projection_dim,
         clip_extra_context_tokens=4,
     )
     ip_adapter = IPAdapter(unet, image_proj_model, adapter_modules, args.pretrained_ip_adapter_path)
 
     if args.train_type == "only-clip":
         ip_adapter.requires_grad_(False)
-        params_to_opt = itertools.chain(image_encoder.parameters())
+        # params_to_opt = itertools.chain(image_encoder.parameters())
+        params_to_opt = itertools.chain(clip_model.vision_model.parameters(),clip_model.visual_projection.parameters())
     elif args.train_type == "full":
         params_to_opt = itertools.chain(
-            ip_adapter.image_proj_model.parameters(), ip_adapter.adapter_modules.parameters(), image_encoder.parameters()
+            ip_adapter.image_proj_model.parameters(), ip_adapter.adapter_modules.parameters(), clip_model.vision_model.parameters(),clip_model.visual_projection.parameters()
         )
     # optimizer
     # params_to_opt = itertools.chain(ip_adapter.image_proj_model.parameters(), ip_adapter.adapter_modules.parameters())
@@ -509,11 +516,13 @@ def main():
         
     # Prepare everything with our `accelerator`.
     # ip_adapter, optimizer, train_dataloader = accelerator.prepare(ip_adapter, optimizer, train_dataloader)
-    image_encoder, ip_adapter, optimizer, train_dataloader,eval_loader = accelerator.prepare(
-        image_encoder, ip_adapter, optimizer, train_dataloader,eval_loader
+    clip_model, ip_adapter, optimizer, train_dataloader,eval_loader = accelerator.prepare(
+        clip_model, ip_adapter, optimizer, train_dataloader,eval_loader
     )
-
-
+    # image_encoder, ip_adapter, optimizer, train_dataloader,eval_loader = accelerator.prepare(
+    #     image_encoder, ip_adapter, optimizer, train_dataloader,eval_loader
+    # )
+    
     global_step = 0
     start_epoch = 0
     if args.resume_path != "_":
@@ -526,14 +535,14 @@ def main():
         global_step = int(tmp[1].replace("-step",""))
         start_epoch = int(tmp[2].replace("-epoch",""))
         
-
     begin = time.perf_counter()
     start_time = time.time()
     for epoch in range(start_epoch, args.num_train_epochs):
         # begin = time.perf_counter()
         for step, batch in enumerate(train_dataloader):
             # load_data_time = time.perf_counter() - begin
-            with accelerator.accumulate(image_encoder,ip_adapter):
+            # with accelerator.accumulate(image_encoder,ip_adapter):
+            with accelerator.accumulate(clip_model,ip_adapter):
                 # Convert images to latent space
                 with torch.no_grad():
                     latents = vae.encode(
@@ -562,9 +571,10 @@ def main():
                 #     image_embeds = image_encoder(
                 #         batch["clip_images"].to(accelerator.device, dtype=weight_dtype)
                 #     ).image_embeds
-                image_embeds = image_encoder(
-                    batch["clip_images"].to(accelerator.device, dtype=weight_dtype)
-                ).image_embeds
+                # image_embeds = image_encoder(
+                #     batch["clip_images"].to(accelerator.device, dtype=weight_dtype)
+                # ).image_embeds
+                image_embeds = clip_model.module.visual_projection(clip_model.module.vision_model(batch['clip_images'].to(accelerator.device,dtype=weight_dtype)).pooler_output)
                 image_embeds_ = []
                 for image_embed, drop_image_embed in zip(image_embeds, batch["drop_image_embeds"]):
                     if drop_image_embed == 1:
@@ -586,28 +596,34 @@ def main():
                     elif args.train_modality == "image-text":
                         text_inputs = batch["text_input_ids"]
                     encoder_hidden_states = text_encoder(text_inputs.to(accelerator.device))[0]
+                    text_embeds_for_clip_loss = clip_model.module.text_projection(clip_model.module.text_model(text_inputs)[1])
 
                 noise_pred = ip_adapter(noisy_latents, timesteps, encoder_hidden_states, image_embeds_dropped)
 
                 # print(f"image embeds(shape): {image_embeds.shape}") # torch.Size([8, 1024])
                 # print(f"image embeds: {image_embeds}")
                 # print(f"text embeds(shape): {encoder_hidden_states.shape}") # torch.Size([8, 77, 768])
-                # print(f"text embeds: {encoder_hidden_states}")
+                # print(f"text embeds: {encoder_hidden_states}")``
                 # calculate loss
                 mse_loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
                 # CALCULATE CLIP LOSS
-                with torch.no_grad():
-                    text_embeds = text_encoder_with_projection(text_inputs.to(accelerator.device)).text_embeds
+                # with torch.no_grad():
+                    # text_embeds = text_encoder_with_projection(text_inputs.to(accelerator.device)).text_embeds
                     # text_embeds = text_encoder_with_projection(text_inputs.cpu()).text_embeds
                 # normalized features
+                # print("image_embeds:",image_embeds.shape)
+                image_embeds = accelerator.gather(image_embeds)
+                text_embeds_for_clip_loss = accelerator.gather(text_embeds_for_clip_loss)
+                
                 image_embeds = image_embeds / image_embeds.norm(p=2, dim=-1, keepdim=True)
-                text_embeds = text_embeds / text_embeds.norm(p=2, dim=-1, keepdim=True)
-                # logit_scale = self.logit_scale.exp()
-                logits_per_text = torch.matmul(text_embeds, image_embeds.t())
+                text_embeds = text_embeds_for_clip_loss / text_embeds_for_clip_loss.norm(p=2, dim=-1, keepdim=True)
+                logit_scale = clip_model.module.logit_scale.exp()
+                logits_per_text = torch.matmul(text_embeds, image_embeds.t())*logit_scale
                 # logits_per_text = torch.matmul(text_embeds.to(accelerator.device), image_embeds.t())
                 clip_loss = get_clip_loss(logits_per_text)
                 # print(f"clip loss: {clip_loss}")
                 # print(f"mse_loss: {mse_loss}")
+                # print(f"device: {accelerator.device}")
                 
                 loss = args.clip_loss_ratio*clip_loss + (1-args.clip_loss_ratio)*mse_loss
                 
@@ -620,11 +636,11 @@ def main():
                 optimizer.zero_grad()
                 
 
-                accelerator.log({"ip-adapter/step_loss": avg_loss,"ip-adapter/epoch":epoch, "ip-adapter/mean_timestep":mean_timestep}, step=step)
-                if accelerator.is_main_process and step % 10 == 0:
+                accelerator.log({"ip-adapter/step_loss": loss,"ip-adapter/clip_loss":clip_loss,"ip-adapter/mse_loss":avg_loss, "ip-adapter/epoch":epoch, "ip-adapter/mean_timestep":mean_timestep}, step=step)
+                if accelerator.is_main_process and step % 100 == 0:
                     print(
-                        "Global_Step {}, Epoch {}, step {}, time: {}, mean_timestep: {}, step_loss: {}, time_passed: {}".format(
-                            global_step, epoch, step, time.perf_counter() - begin,mean_timestep, avg_loss, timedelta(seconds=(time.time()-start_time))
+                        "Global_Step {}, Epoch {}, step {}, time: {}, mean_timestep: {}, step_loss: {}, clip_loss: {}, mse_loss: {}, time_passed: {}".format(
+                            global_step, epoch, step, time.perf_counter() - begin,mean_timestep, loss,clip_loss , avg_loss,timedelta(seconds=(time.time()-start_time))
                         )
                     )
                     begin = time.perf_counter()
@@ -644,7 +660,8 @@ def main():
         
         # epoch complete. 1-nn eval
         if epoch%args.eval_epoch == 0:
-            acc = evaluate_nn(image_encoder, eval_loader['val'], eval_loader['test'])
+            # acc = evaluate_nn(image_encoder, eval_loader['val'], eval_loader['test'])
+            acc = evaluate_nn(clip_model.module.vision_model, eval_loader['val'], eval_loader['test'])
             accelerator.log({"ip-adapter/1nn": acc}, step=step)
             print(f"1-NN accuracy: {acc}")
         
