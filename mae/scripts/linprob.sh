@@ -7,10 +7,10 @@
 # MODEL_NAME="clip"
 # CKPT_PATH=/scratch/choi/model/CLIP-ViT-H-14-laion2B-s32B-b79K/
 
-MODEL_NAME="finetuned-clip_full_image-only_imagenet100_timestep-400-600_clip-loss-ratio-0.999_epoch-10"
+MODEL_NAME="finetuned-clip_full_image-only_imagenet100_timestep-400-600_clip-loss-ratio-0.999_epoch-1_mse_only_test"
 # MODEL_NAME="finetuned-clip_full_image-text_imagenet100_timestep-400-600_epoch-1"
 # CKPT_PATH=/scratch/choi/output/Diff-Rep/ViT-H/ip-adapter/full_image-only_mscoco_04-27_20:20/checkpoint-2000
-CKPT_PATH=/scratch/choi/output/Diff-Rep/ViT-H/ip-adapter/full_image-text_imagenet100_timestep-400-600_clip-loss-ratio-0.999_05-19_15:51/checkpoint_60330-step_10-epoch
+CKPT_PATH=/scratch/choi/output/Diff-Rep/ViT-H/ip-adapter/full_image-text_imagenet100_timestep-400-600_clip-loss-ratio-0.999_06-04_05:01/checkpoint_6033-step_1-epoch
 
 
 # DATASET_TYPE=in1k

@@ -20,8 +20,8 @@ TRAIN_MODALITY=image-text
 # TIME_STEP=all
 TIMESTEP=400-600
 
-# RESUME_PATH=_
-RESUME_PATH=/scratch/choi/output/Diff-Rep/ViT-H/ip-adapter/full_image-text_imagenet100_timestep-400-600_clip-loss-ratio-0.999_05-19_15:51/checkpoint_42231-step_7-epoch
+RESUME_PATH=_
+# RESUME_PATH=/scratch/choi/output/Diff-Rep/ViT-H/ip-adapter/full_image-text_imagenet100_timestep-400-600_clip-loss-ratio-0.999_05-19_15:51/checkpoint_42231-step_7-epoch
 
 CLIP_LOSS_RATIO=0.999
 ###########################################################
@@ -53,7 +53,7 @@ accelerate launch --num_processes=3 --multi_gpu --main_process_port=29700 --mixe
   --timestep ${TIMESTEP} \
   --mixed_precision="fp16" \
   --resolution=512 \
-  --train_batch_size=6 \
+  --train_batch_size=7 \
   --dataloader_num_workers=8 \
   --learning_rate=1e-04 \
   --weight_decay=0.01 \
@@ -70,3 +70,5 @@ accelerate launch --num_processes=3 --multi_gpu --main_process_port=29700 --mixe
 
 # 14682MiB / 32510MiB  for batch 1 imagenet1k
 # 14682MiB / 32510MiB for batch 1 mscoco
+
+#  31002MiB / 32510MiB for batch 7
