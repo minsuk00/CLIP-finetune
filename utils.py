@@ -5,6 +5,13 @@ import ignite.distributed as idist
 from ignite.utils import convert_tensor
 
 
+def save_file(target_file: str, destination: str):
+    with open(destination, 'w+') as wf:
+        with open(target_file, "r") as rf:
+            content = rf.read()
+        wf.write(content)
+
+
 @torch.no_grad()
 def evaluate_nn(model, trainloader, testloader):
     X_train, Y_train = [idist.all_gather(_) for _ in collect_features(model, trainloader)]

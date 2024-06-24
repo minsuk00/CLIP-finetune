@@ -1,3 +1,4 @@
+# only both diffusion loss + clip loss
 import os
 import random
 import argparse
@@ -5,6 +6,7 @@ from pathlib import Path
 import json
 import itertools
 import time
+import numpy as np
 
 import torch
 import torch.distributed
@@ -18,7 +20,13 @@ from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
-from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection, CLIPTextModelWithProjection, CLIPModel
+from transformers import (
+    CLIPTextModel,
+    CLIPTokenizer,
+    CLIPVisionModelWithProjection,
+    CLIPTextModelWithProjection,
+    CLIPModel,
+)
 from safetensors import safe_open
 from datetime import datetime, timedelta
 from typing import Literal
@@ -26,32 +34,42 @@ from typing import Literal
 from ip_adapter.ip_adapter import ImageProjModel
 from ip_adapter.utils import is_torch2_available
 
-from utils import evaluate_nn
+from utils import evaluate_nn, save_file
 import ignite.distributed as idist
 
 if is_torch2_available():
-    from ip_adapter.attention_processor import IPAttnProcessor2_0 as IPAttnProcessor, AttnProcessor2_0 as AttnProcessor
+    from ip_adapter.attention_processor import (
+        IPAttnProcessor2_0 as IPAttnProcessor,
+        AttnProcessor2_0 as AttnProcessor,
+    )
 else:
     from ip_adapter.attention_processor import IPAttnProcessor, AttnProcessor
 
 
-def contrastive_loss(logits: torch.Tensor) -> torch.Tensor:
-    return nn.functional.cross_entropy(logits, torch.arange(len(logits), device=logits.device))
+# def get_scaling_factor(epoch, total_epochs):
+#     initial_scaling = 1e-4
+#     final_scaling = 1.0
+#     scaling_factor = initial_scaling + (final_scaling - initial_scaling) * (epoch / total_epochs)
+#     return scaling_factor
 
-
-def get_clip_loss(similarity: torch.Tensor) -> torch.Tensor:
-    caption_loss = contrastive_loss(similarity)
-    image_loss = contrastive_loss(similarity.t())
-    return (caption_loss + image_loss) / 2.0
 
 # Dataset
-
-
 class MyDataset(torch.utils.data.Dataset):
 
     def __init__(
-        self, json_file, tokenizer, size=512, t_drop_rate=0.05, i_drop_rate=0.05, ti_drop_rate=0.05, image_root_path="", dataset_type: Literal['mscoco', 'imagenet1k', 'imagenet100'] = 'mscoco'
+        self,
+        json_file,
+        tokenizer=None,
+        size=512,
+        t_drop_rate=0.05,
+        i_drop_rate=0.05,
+        ti_drop_rate=0.05,
+        image_root_path="",
+        dataset_type: Literal['mscoco', 'imagenet1k', 'imagenet100'] = 'mscoco',
     ):
+        if dataset_type == "mscoco":
+            raise NotImplementedError("Need to implement text precompute for mscoco")
+
         super().__init__()
 
         self.tokenizer = tokenizer
@@ -63,6 +81,9 @@ class MyDataset(torch.utils.data.Dataset):
         self.dataset_type = dataset_type
 
         self.data = json.load(open(json_file))  # list of dict: [{"image_file": "1.png", "text": "A dog"}]
+
+        self.text_embedding_dict_L = torch.load("IN100_text_embedding_dict_L.pt")
+        self.text_embedding_dict_with_projection_H = torch.load("IN100_text_embedding_dict_with_projection_H.pt")
 
         self.transform = transforms.Compose(
             [
@@ -76,7 +97,7 @@ class MyDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        text = item["text"]
+        # text = item["text"]
         image_file = item["image_file"]
 
         # read image
@@ -90,6 +111,8 @@ class MyDataset(torch.utils.data.Dataset):
 
         image = self.transform(raw_image.convert("RGB"))
         clip_image = self.clip_image_processor(images=raw_image, return_tensors="pt").pixel_values
+        text_sd = self.text_embedding_dict_L[class_id]
+        text_clip = self.text_embedding_dict_with_projection_H[class_id]
 
         # drop
         drop_image_embed = 0
@@ -97,24 +120,28 @@ class MyDataset(torch.utils.data.Dataset):
         if rand_num < self.i_drop_rate:
             drop_image_embed = 1
         elif rand_num < (self.i_drop_rate + self.t_drop_rate):
-            text = ""
+            # text = ""
+            text_sd = self.text_embedding_dict_L[""]
         elif rand_num < (self.i_drop_rate + self.t_drop_rate + self.ti_drop_rate):
-            text = ""
+            # text = ""
+            text_sd = self.text_embedding_dict_L[""]
             drop_image_embed = 1
         # get text and tokenize
-        text_input_ids = self.tokenizer(
-            text,
-            max_length=self.tokenizer.model_max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        ).input_ids
+        # text_input_ids = self.tokenizer(
+        #     text,
+        #     max_length=self.tokenizer.model_max_length,
+        #     padding="max_length",
+        #     truncation=True,
+        #     return_tensors="pt",
+        # ).input_ids
 
         return {
             "image": image,
-            "text_input_ids": text_input_ids,
+            # "text_input_ids": text_input_ids,
             "clip_image": clip_image,
             "drop_image_embed": drop_image_embed,
+            "text_embeddings_sd": text_sd,
+            "text_embeddings_clip": text_clip,
         }
 
     def __len__(self):
@@ -145,9 +172,7 @@ def get_loader(args):
         ]
     )
 
-    dataset_val = datasets.ImageFolder(
-        os.path.join(args.data_root_path), transform=transform_train
-    )
+    dataset_val = datasets.ImageFolder(os.path.join(args.data_root_path), transform=transform_train)
     dataset_test = datasets.ImageFolder(
         os.path.join(args.data_root_path.replace("train", "val")), transform=transform_val
     )
@@ -156,13 +181,16 @@ def get_loader(args):
         dataset=dataset_val,
         batch_size=256,
         num_workers=4,
-        shuffle=True, drop_last=True,
-        pin_memory=True,)
+        shuffle=True,
+        drop_last=True,
+        pin_memory=True,
+    )
     loader['test'] = idist.auto_dataloader(
         dataset=dataset_test,
         batch_size=256,
         num_workers=4,
-        pin_memory=True,)
+        pin_memory=True,
+    )
 
     # loader['val'] = torch.utils.data.DataLoader(
     #     dataset_val,
@@ -184,13 +212,18 @@ def get_loader(args):
 
 def collate_fn(data):
     images = torch.stack([example["image"] for example in data])
-    text_input_ids = torch.cat([example["text_input_ids"] for example in data], dim=0)
+    # text_input_ids = torch.cat([example["text_input_ids"] for example in data], dim=0)
     clip_images = torch.cat([example["clip_image"] for example in data], dim=0)
     drop_image_embeds = [example["drop_image_embed"] for example in data]
 
+    text_sd = torch.stack([example["text_embeddings_sd"] for example in data], dim=0)
+    text_clip = torch.stack([example["text_embeddings_clip"] for example in data], dim=0)
+
     return {
         "images": images,
-        "text_input_ids": text_input_ids,
+        # "text_input_ids": text_input_ids,
+        "text_embeddings_sd": text_sd,
+        "text_embeddings_clip": text_clip,
         "clip_images": clip_images,
         "drop_image_embeds": drop_image_embeds,
     }
@@ -307,7 +340,7 @@ def parse_args():
         type=str,
         default="all",
         required=True,
-        help="time step range to train from. all means random from 0 - 1000. e.g. 400-600"
+        help="time step range to train from. all means random from 0 - 1000. e.g. 400-600",
     )
     parser.add_argument(
         "--image_encoder_path",
@@ -346,8 +379,12 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=1e-2, help="Weight decay to use.")
     parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument(
-        "--train_batch_size", type=int, default=8, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size",
+        type=int,
+        default=64,
+        help="Batch size (per device) for the training dataloader.",
     )
+    parser.add_argument("--gradient_accum_step", type=int, default=4, help="gradient accumulation step size.")
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
@@ -396,12 +433,22 @@ def parse_args():
 
 def main():
     args = parse_args()
+    date = datetime.now().strftime("%m-%d_%H:%M")
     if args.resume_path != "_":
         args.output_dir = "/".join(args.resume_path.split("/")[:-1])
     else:
-        args.output_dir += f"/{args.train_type}_{args.train_modality}_{args.dataset_type}_timestep-{
-            args.timestep}_clip-loss-ratio-{args.clip_loss_ratio}_{datetime.now().strftime("%m-%d_%H:%M")}"
+        args.output_dir += "/{train_type}_{train_modality}_{dataset_type}_timestep-{timestep}_clip-loss-ratio-{clip_loss_ratio}_{date}".format(
+            train_type=args.train_type,
+            train_modality=args.train_modality,
+            dataset_type=args.dataset_type,
+            timestep=args.timestep,
+            clip_loss_ratio=args.clip_loss_ratio,
+            date=date,
+        )
     logging_dir = Path(args.output_dir, args.logging_dir)
+    logging_dir.mkdir(parents=True, exist_ok=True)
+    save_file("./tutorial_train.py", logging_dir / "train.py")
+    save_file("./scripts/train.sh", logging_dir / "train.sh")
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
     ipg_handler = InitProcessGroupKwargs(timeout=timedelta(seconds=5400))
@@ -411,11 +458,11 @@ def main():
         log_with=args.report_to,
         project_config=accelerator_project_config,
         kwargs_handlers=[ipg_handler],
-        # gradient_accumulation_steps=2,
+        gradient_accumulation_steps=args.gradient_accum_step,
     )
 
     # hps = {"learning_rate": args.learning_rate}
-    accelerator.init_trackers(f"{datetime.now().strftime("%m-%d_%H:%M")}")
+    accelerator.init_trackers("{date}".format(date=date))
 
     if accelerator.is_main_process:
         print(f"Logging to {args.output_dir}")
@@ -424,27 +471,30 @@ def main():
 
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
+    # tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
-    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
+    # text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
     # image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.image_encoder_path)
     clip_model = CLIPModel.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
+    # image_encoder = CLIPVisionModelWithProjection.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
     # freeze parameters of models to save more memory
     unet.requires_grad_(False)
     vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
-    # image_encoder.requires_grad_(False)
-    # image_encoder.requires_grad_(True)
-    # text_encoder_with_projection = CLIPTextModelWithProjection.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
-    # text_encoder_with_projection.requires_grad_(False)
-    clip_model.requires_grad_(False)
-    clip_model.vision_model.requires_grad_(True)
-    clip_model.visual_projection.requires_grad_(True)
+
+    del clip_model.text_model
+    del clip_model.text_projection
+    # clip_model.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+    # clip_model.mse_loss_scale = nn.Parameter(torch.zeros([]))  # TODO: try parameter loss scaling
+    clip_model.requires_grad_(True)
 
     # dataloader
     train_dataset = MyDataset(
-        args.data_json_file, tokenizer=tokenizer, size=args.resolution, image_root_path=args.data_root_path, dataset_type=args.dataset_type,
+        args.data_json_file,
+        tokenizer=None,
+        size=args.resolution,
+        image_root_path=args.data_root_path,
+        dataset_type=args.dataset_type,
     )
     # print("dataset length: ", train_dataset.__len__())
     # 118287 -> 4920 steps per epoch (for mscoco) (batch = 8x3=24)
@@ -453,7 +503,7 @@ def main():
         train_dataset,
         shuffle=True,
         collate_fn=collate_fn,
-        batch_size=args.train_batch_size,
+        batch_size=args.train_batch_size * args.gradient_accum_step,
         num_workers=args.dataloader_num_workers,
     )
 
@@ -490,19 +540,12 @@ def main():
         weight_dtype = torch.float16
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
-    # unet.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
-    # image_encoder.to(accelerator.device, dtype=weight_dtype)
-    # image_encoder.to(accelerator.device)  # let amp set dtype
-    # text_encoder_with_projection.to(accelerator.device)  # let amp set dtype
-    clip_model.to(accelerator.device)
 
     # ip-adapter
     # Linear & LN Layer
     image_proj_model = ImageProjModel(
         cross_attention_dim=unet.config.cross_attention_dim,
-        # clip_embeddings_dim=image_encoder.config.projection_dim,
         clip_embeddings_dim=clip_model.config.projection_dim,
         clip_extra_context_tokens=4,
     )
@@ -510,25 +553,27 @@ def main():
 
     if args.train_type == "only-clip":
         ip_adapter.requires_grad_(False)
-        # params_to_opt = itertools.chain(image_encoder.parameters())
-        params_to_opt = itertools.chain(clip_model.vision_model.parameters(), clip_model.visual_projection.parameters())
+        params_to_opt = itertools.chain(
+            clip_model.vision_model.parameters(),
+            clip_model.visual_projection.parameters(),
+            clip_model.logit_scale,
+        )
     elif args.train_type == "full":
         params_to_opt = itertools.chain(
-            ip_adapter.image_proj_model.parameters(), ip_adapter.adapter_modules.parameters(
-            ), clip_model.vision_model.parameters(), clip_model.visual_projection.parameters()
+            ip_adapter.image_proj_model.parameters(),
+            ip_adapter.adapter_modules.parameters(),
+            clip_model.vision_model.parameters(),
+            clip_model.visual_projection.parameters(),
+            [clip_model.logit_scale],
+            # [clip_model.logit_scale, clip_model.mse_loss_scale],
         )
     # optimizer
-    # params_to_opt = itertools.chain(ip_adapter.image_proj_model.parameters(), ip_adapter.adapter_modules.parameters())
     optimizer = torch.optim.AdamW(params_to_opt, lr=args.learning_rate, weight_decay=args.weight_decay)
 
     # Prepare everything with our `accelerator`.
-    # ip_adapter, optimizer, train_dataloader = accelerator.prepare(ip_adapter, optimizer, train_dataloader)
     clip_model, ip_adapter, optimizer, train_dataloader, eval_loader = accelerator.prepare(
         clip_model, ip_adapter, optimizer, train_dataloader, eval_loader
     )
-    # image_encoder, ip_adapter, optimizer, train_dataloader,eval_loader = accelerator.prepare(
-    #     image_encoder, ip_adapter, optimizer, train_dataloader,eval_loader
-    # )
 
     global_step = 0
     start_epoch = 0
@@ -536,155 +581,130 @@ def main():
         print("Loading resume ckpt")
         accelerator.load_state(args.resume_path)
         print(f"accelerator loaded train state from: {args.resume_path}")
-        # global_step = int(args.resume_path.split("/")[-1].replace("checkpoint-",""))
 
         tmp = args.resume_path.split("/")[-1].split("_")
         global_step = int(tmp[1].replace("-step", ""))
         start_epoch = int(tmp[2].replace("-epoch", ""))
 
-    begin = time.perf_counter()
+    # begin = time.perf_counter()
     start_time = time.time()
+    accelerator.print(f"Batch size per gradient update: {args.gradient_accum_step * args.train_batch_size}")
+
+    # loss_scale_list = torch.linspace(1e-5, 5e-3, 100)
     for epoch in range(start_epoch, args.num_train_epochs):
-        # begin = time.perf_counter()
         for step, batch in enumerate(train_dataloader):
-            # load_data_time = time.perf_counter() - begin
-            # with accelerator.accumulate(image_encoder,ip_adapter):
-            with accelerator.accumulate(clip_model, ip_adapter):
-                # Convert images to latent space
-                with torch.no_grad():
-                    latents = vae.encode(
-                        batch["images"].to(accelerator.device, dtype=weight_dtype)
-                    ).latent_dist.sample()
-                    latents = latents * vae.config.scaling_factor
+            text_embeds = batch["text_embeddings_clip"] / batch["text_embeddings_clip"].norm(p=2, dim=-1, keepdim=True)
+            for i in range(args.gradient_accum_step):
+                idx_start = args.train_batch_size * i
+                idx_end = args.train_batch_size * (i + 1)
+                minibatch_images = batch["images"][idx_start:idx_end]
+                minibatch_clip_images = batch["clip_images"][idx_start:idx_end]
+                minibatch_drop_image_embeds = batch["drop_image_embeds"][idx_start:idx_end]
+                minibatch_text_embeddings_sd = batch["text_embeddings_sd"][idx_start:idx_end]
 
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                bsz = latents.shape[0]
-                # Sample a random timestep for each image
-                if args.timestep == "all":
-                    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps,
-                                              (bsz,), device=latents.device)
-                else:
-                    s = int(args.timestep.split("-")[0])
-                    e = int(args.timestep.split("-")[1])
-                    timesteps = torch.randint(s, e, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
-                mean_timestep = torch.mean(timesteps, dtype=float).item()
-
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-                # with torch.no_grad():
-                #     image_embeds = image_encoder(
-                #         batch["clip_images"].to(accelerator.device, dtype=weight_dtype)
-                #     ).image_embeds
-                # image_embeds = image_encoder(
-                #     batch["clip_images"].to(accelerator.device, dtype=weight_dtype)
-                # ).image_embeds
-                image_embeds = clip_model.module.visual_projection(clip_model.module.vision_model(
-                    batch['clip_images'].to(accelerator.device, dtype=weight_dtype)).pooler_output)
-                image_embeds_ = []
-                for image_embed, drop_image_embed in zip(image_embeds, batch["drop_image_embeds"]):
-                    if drop_image_embed == 1:
-                        image_embeds_.append(torch.zeros_like(image_embed))
-                    else:
-                        image_embeds_.append(image_embed)
-                image_embeds_dropped = torch.stack(image_embeds_)
-
-                with torch.no_grad():
-                    if args.train_modality == "image-only":
-                        text = [""]*len(batch['text_input_ids'])
-                        text_inputs = tokenizer(
-                            text,
-                            max_length=tokenizer.model_max_length,
-                            padding="max_length",
-                            truncation=True,
-                            return_tensors="pt",
-                        ).input_ids
-                    elif args.train_modality == "image-text":
-                        text_inputs = batch["text_input_ids"]
-                    encoder_hidden_states = text_encoder(text_inputs.to(accelerator.device))[0]
-                    text_embeds_for_clip_loss = clip_model.module.text_projection(
-                        clip_model.module.text_model(text_inputs)[1])
-
-                noise_pred = ip_adapter(noisy_latents, timesteps, encoder_hidden_states, image_embeds_dropped)
-
-                # print(f"image embeds(shape): {image_embeds.shape}") # torch.Size([8, 1024])
-                # print(f"image embeds: {image_embeds}")
-                # print(f"text embeds(shape): {encoder_hidden_states.shape}") # torch.Size([8, 77, 768])
-                # print(f"text embeds: {encoder_hidden_states}")``
-                # calculate loss
-                mse_loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
-                # CALCULATE CLIP LOSS
-                # with torch.no_grad():
-                # text_embeds = text_encoder_with_projection(text_inputs.to(accelerator.device)).text_embeds
-                # text_embeds = text_encoder_with_projection(text_inputs.cpu()).text_embeds
-                # normalized features
-                # print("image_embeds:",image_embeds.shape)
-                # print(image_embeds)
-                image_embeds = accelerator.gather(image_embeds)
-                # image_embeds = idist.all_gather(image_embeds)
-                # output = [torch.empty((bsz, 1024), device=accelerator.device) for _ in range(3)]
-                # image_embeds = torch.distributed.all_gather(output, image_embeds)
-                # print(image_embeds)
-                # print(output)
-
-                # exit()
-                text_embeds_for_clip_loss = accelerator.gather(text_embeds_for_clip_loss)
-
-                image_embeds = image_embeds / image_embeds.norm(p=2, dim=-1, keepdim=True)
-                text_embeds = text_embeds_for_clip_loss / text_embeds_for_clip_loss.norm(p=2, dim=-1, keepdim=True)
-                logit_scale = clip_model.module.logit_scale.exp()
-                logits_per_text = torch.matmul(text_embeds, image_embeds.t())*logit_scale
-                # logits_per_text = torch.matmul(text_embeds.to(accelerator.device), image_embeds.t())
-                clip_loss = get_clip_loss(logits_per_text)
-                # print(f"clip loss: {clip_loss}")
-                # print(f"mse_loss: {mse_loss}")
-                # print(f"device: {accelerator.device}")
-
-                # loss = args.clip_loss_ratio*clip_loss + (1-args.clip_loss_ratio)*mse_loss
-                # loss = (1-args.clip_loss_ratio)*mse_loss
-                loss = args.clip_loss_ratio*clip_loss
-
-                # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(mse_loss.repeat(args.train_batch_size)).mean().item()
-
-                # Backpropagate
-                accelerator.backward(loss)
-                optimizer.step()
-                optimizer.zero_grad()
-
-                accelerator.log({"ip-adapter/step_loss": loss, "ip-adapter/clip_loss": clip_loss, "ip-adapter/mse_loss": avg_loss,
-                                "ip-adapter/epoch": epoch, "ip-adapter/mean_timestep": mean_timestep}, step=step)
-                if accelerator.is_main_process and step % 100 == 0:
-                    print(
-                        "Global_Step {}, Epoch {}, step {}, time: {}, mean_timestep: {}, step_loss: {}, clip_loss: {}, mse_loss: {}, time_passed: {}".format(
-                            global_step, epoch, step, time.perf_counter(
-                            ) - begin, mean_timestep, loss, clip_loss, avg_loss, timedelta(seconds=(time.time()-start_time))
+                with accelerator.accumulate(clip_model, ip_adapter):
+                    # Convert images to latent space
+                    with torch.no_grad():
+                        latents = vae.encode(
+                            minibatch_images.to(accelerator.device, dtype=weight_dtype)
+                        ).latent_dist.sample()
+                        latents = latents * vae.config.scaling_factor
+                    # Sample noise that we'll add to the latents
+                    noise = torch.randn_like(latents)
+                    bsz = latents.shape[0]
+                    # Sample a random timestep for each image
+                    if args.timestep == "all":
+                        timesteps = torch.randint(
+                            0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device
                         )
+                    else:
+                        s = int(args.timestep.split("-")[0])
+                        e = int(args.timestep.split("-")[1])
+                        timesteps = torch.randint(s, e, (bsz,), device=latents.device)
+                    timesteps = timesteps.long()
+                    mean_timestep = torch.mean(timesteps, dtype=float).item()
+
+                    # Add noise to the latents according to the noise magnitude at each timestep
+                    # (this is the forward diffusion process)
+                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+                    image_embeds = clip_model.module.visual_projection(
+                        clip_model.module.vision_model(
+                            minibatch_clip_images.to(accelerator.device, dtype=weight_dtype)
+                        ).pooler_output
                     )
-                    begin = time.perf_counter()
+                    image_embeds_ = []
+                    for image_embed, drop_image_embed in zip(image_embeds, minibatch_drop_image_embeds):
+                        if drop_image_embed == 1:
+                            image_embeds_.append(torch.zeros_like(image_embed))
+                        else:
+                            image_embeds_.append(image_embed)
+                    image_embeds_dropped = torch.stack(image_embeds_)
 
-            global_step += 1
+                    noise_pred = ip_adapter(
+                        noisy_latents, timesteps, minibatch_text_embeddings_sd, image_embeds_dropped
+                    )
 
-            # if global_step % args.save_steps == 0:
-            #     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-            #     accelerator.save_state(save_path, safe_serialization=False)
+                    # calculate loss
+                    mse_loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                    # loss = mse_loss * clip_model.module.mse_loss_scale
+                    # loss = mse_loss * 1e-4
 
-            # begin = time.perf_counter()
-            # break
+                    # CLIP loss
+                    # accelerator.print(text_embeds_for_clip_loss.shape) # torch.Size([28, 1024])
+                    # accelerator.print(image_embeds.shape) # torch.Size([7, 1024])
+                    image_embeds = image_embeds / image_embeds.norm(p=2, dim=-1, keepdim=True)
+                    # accelerator.print(clip_model.module.logit_scale.exp())
+                    logit_scale = clip_model.module.logit_scale.exp()
+                    logits_per_image = torch.matmul(image_embeds, text_embeds.t()) * logit_scale
+                    # logits_per_image = torch.matmul(image_embeds, text_embeds.t())
+                    clip_loss = nn.functional.cross_entropy(
+                        logits_per_image,
+                        idx_start + torch.arange(len(logits_per_image), device=accelerator.device),
+                    )
+                    # loss = clip_loss
+
+                    # loss = args.clip_loss_ratio * clip_loss + (1 - args.clip_loss_ratio) * mse_loss * 1e-4
+                    loss = clip_loss + mse_loss * 1e-3
+
+                    # Gather the losses across all processes for logging (if we use distributed training).
+                    # avg_loss = accelerator.gather(mse_loss.repeat(args.train_batch_size)).mean().item()
+
+                    # Backpropagate
+                    accelerator.backward(loss)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+                global_step += 1
+
+            accelerator.log(
+                {
+                    "ip-adapter/step_loss": loss,
+                    "ip-adapter/mse_loss": mse_loss,
+                    "ip-adapter/clip_loss": clip_loss,
+                    "ip-adapter/mse_loss_scale": 1e-3,
+                    "ip-adapter/epoch": epoch,
+                    "ip-adapter/mean_timestep": mean_timestep,
+                    "ip-adapter/logit_scale": clip_model.module.logit_scale.exp(),
+                },
+                step=step,
+            )
+
+            if accelerator.is_main_process and step % 20 == 0:
+                print(
+                    f"Global_Step {global_step}, Epoch {epoch}, step {step}, step_loss: {loss}, clip_loss: {clip_loss}, mse_loss: {mse_loss}, mse_loss_scale: {1e-3}, logit_scale: {clip_model.module.logit_scale.exp()}, time_passed: {timedelta(seconds=(time.time() - start_time))}"
+                )
+                # begin = time.perf_counter()
 
         save_path = os.path.join(args.output_dir, f"checkpoint_{global_step}-step_{epoch+1}-epoch")
         accelerator.save_state(save_path, safe_serialization=False)
-        print(f"checkpoint saved: {global_step}-step_{epoch+1}-epoch")
+        accelerator.print(f"checkpoint saved: {global_step}-step_{epoch+1}-epoch")
 
         # epoch complete. 1-nn eval
         if epoch % args.eval_epoch == 0:
-            # acc = evaluate_nn(image_encoder, eval_loader['val'], eval_loader['test'])
             acc = evaluate_nn(clip_model.module.vision_model, eval_loader['val'], eval_loader['test'])
             accelerator.log({"ip-adapter/1nn": acc}, step=step)
-            print(f"1-NN accuracy: {acc}")
+            accelerator.print(f"1-NN accuracy: {acc}")
 
     accelerator.end_training()
 
